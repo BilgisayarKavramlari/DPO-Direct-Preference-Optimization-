@@ -70,37 +70,90 @@ def main():
     train_dataset = load_dataset("json", data_files=args.train_jsonl, split="train")
     eval_dataset = load_dataset("json", data_files=args.eval_jsonl, split="train") if (args.eval_jsonl and os.path.exists(args.eval_jsonl)) else None
 
-    targs = TrainingArguments(
-        output_dir=args.output_dir,
+    from transformers import TrainingArguments
+
+    # --- ESKİ ---
+    # targs = TrainingArguments(
+    #     output_dir=args.output_dir,
+    #     learning_rate=args.learning_rate,
+    #     per_device_train_batch_size=args.per_device_train_batch_size,
+    #     per_device_eval_batch_size=args.per_device_eval_batch_size,
+    #     gradient_accumulation_steps=args.gradient_accumulation_steps,
+    #     max_steps=args.max_steps,
+    #     evaluation_strategy="steps" if eval_dataset is not None else "no",
+    #     eval_steps=args.eval_steps if eval_dataset is not None else None,
+    #     save_steps=args.save_steps,
+    #     logging_steps=10,
+    #     bf16=(dtype==torch.bfloat16),
+    #     fp16=(dtype==torch.float16),
+    #     lr_scheduler_type="cosine",
+    #     warmup_ratio=args.warmup_ratio,
+    #     optim="paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
+    #     report_to="none",
+    # )
+
+    # --- YENİ (Transformers >=4.55 uyumlu) ---
+    targs = TrainingArguments(args.output_dir)
+
+    # eğitimle ilgili temel argümanlar
+    targs = targs.set_training(
         learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        batch_size=args.per_device_train_batch_size,
         max_steps=args.max_steps,
-        evaluation_strategy="steps" if eval_dataset is not None else "no",
-        eval_steps=args.eval_steps if eval_dataset is not None else None,
-        save_steps=args.save_steps,
-        logging_steps=10,
-        bf16=(dtype==torch.bfloat16),
-        fp16=(dtype==torch.float16),
-        lr_scheduler_type="cosine",
-        warmup_ratio=args.warmup_ratio,
-        optim="paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+    )
+
+    # değerlendirme (eval dataset varsa)
+    if eval_dataset is not None:
+        targs = targs.set_evaluate(
+            strategy="steps",          # "no" | "epoch" | "steps"
+            steps=args.eval_steps,
+            batch_size=args.per_device_eval_batch_size,
+        )
+
+    # kayıt (checkpoint) sıklığı
+    targs = targs.set_save(
+        strategy="steps",
+        steps=args.save_steps,
+    )
+
+    # logging
+    targs = targs.set_logging(
+        strategy="steps",
+        steps=10,
         report_to="none",
     )
+
+    # LR scheduler
+    targs = targs.set_lr_scheduler(
+        name="cosine",
+        warmup_ratio=args.warmup_ratio,
+    )
+
+    # optimizer
+    targs = targs.set_optimizer(
+        name="adamw_torch",           # CUDA’da isterseniz "adamw_torch_fused" deneyebilirsiniz
+        learning_rate=args.learning_rate,
+    )
+
+    # sayısal tipler (bf16/fp16) – yeni API’de bunlar hâlâ TrainingArguments alanı
+    targs.bf16 = (dtype == torch.bfloat16)
+    targs.fp16 = (dtype == torch.float16)
+
 
     dpo = DPOTrainer(
         model=model,
         ref_model=None,
         args=targs,
-        beta=0.1,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         max_length=1024,
         max_prompt_length=512,
         max_target_length=512,
+        loss_type="sigmoid",   # varsayılan DPO kaybı
     )
+
 
     dpo.train()
     dpo.save_model(args.output_dir)
