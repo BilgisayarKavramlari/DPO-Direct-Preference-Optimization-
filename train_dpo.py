@@ -1,11 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import os, argparse
+
+import os, argparse, random
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
-from trl import DPOTrainer
+from trl import DPOConfig, DPOTrainer
+
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except Exception:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -13,32 +27,49 @@ def main():
     ap.add_argument("--train_jsonl", type=str, default="data/sample_tiny.jsonl")
     ap.add_argument("--eval_jsonl", type=str, default=None)
     ap.add_argument("--output_dir", type=str, default="models/qwen25-0_5b-dpo")
+
+    # Eğitim hiperparametreleri
     ap.add_argument("--learning_rate", type=float, default=1e-5)
-    ap.add_argument("--per_device_train_batch_size", type=int, default=4)
-    ap.add_argument("--per_device_eval_batch_size", type=int, default=4)
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    ap.add_argument("--max_steps", type=int, default=1000)
-    ap.add_argument("--eval_steps", type=int, default=100)
-    ap.add_argument("--save_steps", type=int, default=200)
+    ap.add_argument("--per_device_train_batch_size", type=int, default=2)   # CPU için küçültüldü
+    ap.add_argument("--per_device_eval_batch_size", type=int, default=2)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=8)   # efektif batch’i korur
+    ap.add_argument("--max_steps", type=int, default=200)                   # duman testi için kısa
+    ap.add_argument("--eval_steps", type=int, default=50)
+    ap.add_argument("--save_steps", type=int, default=100)
     ap.add_argument("--warmup_ratio", type=float, default=0.05)
+
+    # Sayısal tip/cihaz
     ap.add_argument("--bf16", action="store_true")
+
+    # LoRA
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--lora_dropout", type=float, default=0.05)
+
+    # Çeşitli
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    torch.manual_seed(args.seed)
+    set_global_seed(args.seed)
 
+    # ---------------- Tokenizer ----------------
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Uzun sekansları kes: TRL 0.21 internal processing_class bu ayarları kullanır
+    tokenizer.model_max_length = 512
+    tokenizer.truncation = True
+    tokenizer.truncation_side = "left"
 
-    bnb_config = None
-    dtype = torch.bfloat16 if args.bf16 and torch.cuda.is_available() else (torch.float16 if torch.cuda.is_available() else torch.float32)
+    # ---------------- Model (4-bit mümkünse) ----------------
+    dtype = (
+        torch.bfloat16 if (args.bf16 and torch.cuda.is_available())
+        else (torch.float16 if torch.cuda.is_available() else torch.float32)
+    )
     device_map = "auto" if torch.cuda.is_available() else None
 
+    bnb_config = None
     try:
         if torch.cuda.is_available():
             bnb_config = BitsAndBytesConfig(
@@ -54,111 +85,95 @@ def main():
             quantization_config=bnb_config,
         )
     except Exception as e:
-        print(f"[WARN] 4-bit yükleme başarısız: {e}\nTam hassasiyetli yükleniyor.")
-        model = AutoModelForCausalLM.from_pretrained(args.base_model, device_map=device_map, torch_dtype=dtype)
+        print(f"[WARN] 4-bit yükleme başarısız: {e}\nTam hassasiyet (FP) ile yükleniyor.")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model, device_map=device_map, torch_dtype=dtype
+        )
 
+    # Bellek: gradient checkpointing (CPU/GPU fark etmeksizin RAM tüketimini düşürür)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+
+    # ---------------- LoRA (PEFT) ----------------
     lora_cfg = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ],
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
 
+    # ---------------- Dataset ----------------
     train_dataset = load_dataset("json", data_files=args.train_jsonl, split="train")
-    eval_dataset = load_dataset("json", data_files=args.eval_jsonl, split="train") if (args.eval_jsonl and os.path.exists(args.eval_jsonl)) else None
+    eval_dataset = None
+    if args.eval_jsonl and os.path.exists(args.eval_jsonl):
+        eval_dataset = load_dataset("json", data_files=args.eval_jsonl, split="train")
 
-    from transformers import TrainingArguments
+    # ---------------- DPOConfig (TRL 0.21) ----------------
+    cfg = DPOConfig(
+        output_dir=args.output_dir,
 
-    # --- ESKİ ---
-    # targs = TrainingArguments(
-    #     output_dir=args.output_dir,
-    #     learning_rate=args.learning_rate,
-    #     per_device_train_batch_size=args.per_device_train_batch_size,
-    #     per_device_eval_batch_size=args.per_device_eval_batch_size,
-    #     gradient_accumulation_steps=args.gradient_accumulation_steps,
-    #     max_steps=args.max_steps,
-    #     evaluation_strategy="steps" if eval_dataset is not None else "no",
-    #     eval_steps=args.eval_steps if eval_dataset is not None else None,
-    #     save_steps=args.save_steps,
-    #     logging_steps=10,
-    #     bf16=(dtype==torch.bfloat16),
-    #     fp16=(dtype==torch.float16),
-    #     lr_scheduler_type="cosine",
-    #     warmup_ratio=args.warmup_ratio,
-    #     optim="paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
-    #     report_to="none",
-    # )
-
-    # --- YENİ (Transformers >=4.55 uyumlu) ---
-    targs = TrainingArguments(args.output_dir)
-
-    # eğitimle ilgili temel argümanlar
-    targs = targs.set_training(
+        # Eğitim
         learning_rate=args.learning_rate,
-        batch_size=args.per_device_train_batch_size,
-        max_steps=args.max_steps,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-    )
+        max_steps=args.max_steps,
 
-    # değerlendirme (eval dataset varsa)
-    if eval_dataset is not None:
-        targs = targs.set_evaluate(
-            strategy="steps",          # "no" | "epoch" | "steps"
-            steps=args.eval_steps,
-            batch_size=args.per_device_eval_batch_size,
-        )
+        # Kayıt / Log / Değerlendirme
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=1,
+        save_safetensors=True,
+        logging_steps=10,
+        eval_strategy=("steps" if eval_dataset is not None else "no"),
+        eval_steps=(args.eval_steps if eval_dataset is not None else 0),
 
-    # kayıt (checkpoint) sıklığı
-    targs = targs.set_save(
-        strategy="steps",
-        steps=args.save_steps,
-    )
+        # Sayısal tipler
+        bf16=(dtype == torch.bfloat16),
+        fp16=(dtype == torch.float16),
 
-    # logging
-    targs = targs.set_logging(
-        strategy="steps",
-        steps=10,
-        report_to="none",
-    )
-
-    # LR scheduler
-    targs = targs.set_lr_scheduler(
-        name="cosine",
+        # LR scheduler & ısınma
+        lr_scheduler_type="cosine",
         warmup_ratio=args.warmup_ratio,
+
+        # Optimizer
+        optim=("paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch"),
+
+        # Dataloader & RAM
+        dataloader_pin_memory=False,
+        dataloader_num_workers=0,
+
+        # DPO özgü
+        loss_type="sigmoid",
+        beta=0.1,
     )
 
-    # optimizer
-    targs = targs.set_optimizer(
-        name="adamw_torch",           # CUDA’da isterseniz "adamw_torch_fused" deneyebilirsiniz
-        learning_rate=args.learning_rate,
-    )
-
-    # sayısal tipler (bf16/fp16) – yeni API’de bunlar hâlâ TrainingArguments alanı
-    targs.bf16 = (dtype == torch.bfloat16)
-    targs.fp16 = (dtype == torch.float16)
-
-
+    # ---------------- DPOTrainer ----------------
+    # TRL 0.21: tokenizer yerine processing_class kullanılır; max_* argümanları yok.
     dpo = DPOTrainer(
         model=model,
-        ref_model=None,
-        args=targs,
+        args=cfg,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        max_length=1024,
-        max_prompt_length=512,
-        max_target_length=512,
-        loss_type="sigmoid",   # varsayılan DPO kaybı
+        processing_class=tokenizer,
+        ref_model=None,
     )
 
-
+    # ---------------- Train & Save ----------------
     dpo.train()
     dpo.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"[OK] Kaydedildi: {args.output_dir}")
+    print(f"[OK] Model ve tokenizer kaydedildi: {args.output_dir}")
+
 
 if __name__ == "__main__":
     main()
